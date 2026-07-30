@@ -1,0 +1,29 @@
+# Sketchfab CLI — one-shot downloads via Docker
+#
+# Build once:
+#   docker compose build
+#
+# Download a model (files appear in ./downloads on the host):
+#   docker compose run --rm downloader "https://sketchfab.com/3d-models/..."
+#
+# Several models:
+#   docker compose run --rm downloader URL1 URL2
+#
+# Custom options (proxy, output is already mounted):
+#   docker compose run --rm downloader --proxy http://host.docker.internal:8080 URL
+#   docker compose run --rm downloader --check-tools
+
+services:
+  downloader:
+    build: .
+    image: sketchfab-cli:latest
+    # Models saved here on the host machine
+    volumes:
+      - ./downloads:/app/downloads
+    # If Sketchfab/Telegram-style HTTPS fails on your network, try:
+    # network_mode: host
+    environment:
+      PYTHONUNBUFFERED: "1"
+      WINEDEBUG: "-all"
+      WINEDLLOVERRIDES: "mscoree,mshtml="
+      NODE_SKIP_PLATFORM_CHECK: "1"

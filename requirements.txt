@@ -1,0 +1,4 @@
+# Python 3.10+ recommended
+requests>=2.31.0
+certifi>=2024.0.0
+urllib3>=2.0.0
