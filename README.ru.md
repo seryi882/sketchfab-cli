@@ -101,7 +101,7 @@ sudo dnf install wine
 ### 1. Скачайте проект
 
 ```bat
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 ```
 
@@ -162,7 +162,7 @@ py -3 main.py
 
 ```bash
 # 1. Клонировать
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 
 # 2. Виртуальное окружение (рекомендуется)
@@ -212,7 +212,7 @@ docker compose version
 ### 2. Клонируйте проект и соберите образ
 
 ```bash
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 
 # Первая сборка может занять несколько минут (образ Python + Wine)
@@ -325,7 +325,7 @@ sketchfab-cli/downloads/Model_Name-xxxxxxxx/
 
 ```bash
 # Python: https://www.python.org/downloads/  или  brew install python
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 
 python3 -m venv .venv
@@ -595,7 +595,7 @@ git add .
 git status   # downloads/ не должен попасть; tools/ — должен
 git commit -m "Initial commit: Sketchfab CLI downloader"
 git branch -M main
-git remote add origin https://github.com/YOUR_USER/sketchfab-cli.git
+git remote add origin https://github.com/seryi882/sketchfab-cli.git
 git push -u origin main
 ```
 

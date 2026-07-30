@@ -101,7 +101,7 @@ Wine is **not** required on Windows.
 ### 1. Get the project
 
 ```bat
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 ```
 
@@ -162,7 +162,7 @@ Done — open the `downloads\` folder.
 
 ```bash
 # 1. Clone
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 
 # 2. Virtual environment (recommended)
@@ -212,7 +212,7 @@ docker compose version
 ### 2. Clone and build the image
 
 ```bash
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 
 # First build may take several minutes (Python base image + Wine)
@@ -325,7 +325,7 @@ On some networks Docker’s bridge cannot reach HTTPS. Then:
 
 ```bash
 # Python: https://www.python.org/downloads/  or  brew install python
-git clone https://github.com/YOUR_USER/sketchfab-cli.git
+git clone https://github.com/seryi882/sketchfab-cli.git
 cd sketchfab-cli
 
 python3 -m venv .venv
@@ -595,7 +595,7 @@ git add .
 git status   # downloads/ should not appear; tools/ should
 git commit -m "Initial commit: Sketchfab CLI downloader"
 git branch -M main
-git remote add origin https://github.com/YOUR_USER/sketchfab-cli.git
+git remote add origin https://github.com/seryi882/sketchfab-cli.git
 git push -u origin main
 ```
 
