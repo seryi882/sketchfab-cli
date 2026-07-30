@@ -13,6 +13,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         wine64 \
+        nodejs \
         ca-certificates \
         curl \
         cabextract \

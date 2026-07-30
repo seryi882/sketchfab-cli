@@ -76,12 +76,18 @@
 
 ### Рекомендуется (локальный Python)
 
-3. **Инструменты конвертации** (`tools/`, ~40 MB, **уже в репозитории**)  
-   - `binzDecrypt.exe` — расшифровка mesh  
-   - `osgconv.exe` + DLL — конвертация в glTF  
-   - Если папки нет (неполный ZIP): `python setup_tools.py`
+3. **Node.js 18+** — нужен для расшифровки `.binz` (WASM)  
+   - Windows/macOS: https://nodejs.org/  
+   - Debian/Ubuntu: `sudo apt install nodejs`  
+   - Проверка: `node --version`
 
-4. **Wine** — **только Linux / macOS** (tools — Windows `.exe`):
+4. **Инструменты** (`tools/`, уже в репозитории)  
+   - `tools/wasm/` — `decrypt_worker.mjs` + `decrypt.wasm` (докачивается из viewer, если нет)  
+   - Static-ключ **каждый запуск берётся из live JS** Sketchfab и кэшируется в `tools/wasm/static_key.txt`  
+   - `osgconv.exe` + DLL — конвертация в glTF (опционально, есть Python-fallback)  
+   - Если tools нет: `python setup_tools.py`
+
+5. **Wine** — **только Linux / macOS**, для `osgconv.exe` (опционально):
 
 ```bash
 # Debian / Ubuntu
@@ -172,8 +178,8 @@ source .venv/bin/activate
 # 3. Зависимости
 pip install -r requirements.txt
 
-# 4. Wine для .exe (tools/ уже в репозитории)
-sudo apt update && sudo apt install -y wine64
+# 4. Node.js (обязателен) + опционально Wine для osgconv
+sudo apt update && sudo apt install -y nodejs wine64
 python setup_tools.py   # только если tools/ отсутствует
 
 # 5. Проверка и скачивание
@@ -476,8 +482,9 @@ docker compose run --rm downloader "https://sketchfab.com/3d-models/..."
 1. Открывает **публичную** страницу viewer модели (как браузер).  
 2. Читает JSON с описанием mesh-файлов (`.binz` и т.д.).  
 3. Скачивает их с CDN Sketchfab.  
-4. Для современного формата расшифровывает `.binz` через `binzDecrypt`  
-   (ключи берутся с **публичной** страницы — это не пароль и не API-token).  
+4. Расшифровывает `.binz` через **WASM** (Node.js):  
+   - per-model ключ из публичного JSON (`diter.b`)  
+   - **static key** автоматически из live JS Sketchfab (кэш: `tools/wasm/static_key.txt`)  
 5. Конвертирует в **glTF** (`osgconv` или встроенный Python-конвертер).  
 6. Пытается скачать текстуры через API `/i/models/{uid}/textures`.  
 7. Кладёт всё в `downloads/` и пишет `info.json`.
@@ -646,10 +653,20 @@ docker compose run --rm downloader "https://sketchfab.com/3d-models/....."
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# Linux/macOS: sudo apt install wine64
+# Нужен Node.js 18+. Linux: sudo apt install nodejs wine64
 python main.py --check-tools
 python main.py "https://sketchfab.com/3d-models/....."
 # → смотрите downloads/
 ```
+
+### Автообновление ключей
+
+Вручную править ключи **не нужно**:
+
+| Материал | Откуда | Как обновляется |
+|---|---|---|
+| Per-model `diter.b` | JSON embed модели | Всегда live |
+| Static 40-hex key | Viewer JS на static.sketchfab.com | Каждый download + кэш `tools/wasm/static_key.txt` |
+| `decrypt.wasm` | Вшит в viewer JS | В репозитории; переизвлекается если нет / при сбое decrypt |
 
 Если что-то не работает — начните с `python main.py --check-tools` (или Docker-аналога) и раздела [Частые вопросы](#частые-вопросы-и-ошибки).

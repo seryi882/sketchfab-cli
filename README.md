@@ -76,12 +76,18 @@ The image already includes Python, Wine, and conversion tools.
 
 ### Recommended (local Python)
 
-3. **Conversion tools** (`tools/`, ~40 MB, **shipped in this repo**)  
-   - `binzDecrypt.exe` — mesh decryption  
-   - `osgconv.exe` + DLLs — glTF conversion  
-   - If the folder is missing (incomplete ZIP): `python setup_tools.py`
+3. **Node.js 18+** — required for current Sketchfab `.binz` decryption (WASM)  
+   - Windows/macOS: https://nodejs.org/  
+   - Debian/Ubuntu: `sudo apt install nodejs`  
+   - Check: `node --version`
 
-4. **Wine** — **Linux / macOS only** (tools are Windows `.exe`):
+4. **Conversion tools** (`tools/`, shipped in this repo)  
+   - `tools/wasm/` — `decrypt_worker.mjs` + `decrypt.wasm` (auto-refreshed from viewer if missing)  
+   - Static decrypt key is **fetched live** from Sketchfab viewer JS each run and cached in `tools/wasm/static_key.txt`  
+   - `osgconv.exe` + DLLs — preferred glTF conversion (optional Python fallback)  
+   - If tools are missing: `python setup_tools.py`
+
+5. **Wine** — **Linux / macOS only**, for `osgconv.exe` (optional):
 
 ```bash
 # Debian / Ubuntu
@@ -92,7 +98,8 @@ sudo apt install wine64
 sudo dnf install wine
 ```
 
-Wine is **not** required on Windows.
+Wine is **not** required on Windows.  
+Docker images already include Node.js + Wine + tools.
 
 ---
 
@@ -172,8 +179,8 @@ source .venv/bin/activate
 # 3. Dependencies
 pip install -r requirements.txt
 
-# 4. Wine for .exe tools (tools/ is already in the repo)
-sudo apt update && sudo apt install -y wine64
+# 4. Node.js (required for decrypt) + optional Wine for osgconv
+sudo apt update && sudo apt install -y nodejs wine64
 python setup_tools.py   # only if tools/ is missing
 
 # 5. Check and download
@@ -332,9 +339,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Wine (Homebrew) — tools/ is already in the repo
+# Node.js required for decrypt
+brew install node
+# Optional Wine for osgconv.exe
 brew install wine-stable
-# or: brew install --cask wine-stable
 python setup_tools.py   # only if tools/ is missing
 
 python main.py --check-tools
@@ -476,8 +484,9 @@ See [Quick start (Docker)](#quick-start-docker).
 1. Opens the model’s **public** viewer page (like a browser).  
 2. Reads JSON describing mesh files (`.binz`, etc.).  
 3. Downloads those files from Sketchfab CDN.  
-4. For the modern format, decrypts `.binz` with `binzDecrypt`  
-   (keys come from the **public** page — not your password or API token).  
+4. Decrypts `.binz` via **WASM** (Node.js) using:  
+   - per-model key from public viewer JSON (`diter.b`)  
+   - **static key auto-extracted** from live Sketchfab JS each run (cached under `tools/wasm/static_key.txt`)  
 5. Converts to **glTF** (`osgconv` or built-in Python converter).  
 6. Tries textures via public API `/i/models/{uid}/textures`.  
 7. Writes everything under `downloads/` plus `info.json`.
@@ -578,7 +587,10 @@ sketchfab-cli/
 ├── download.bat            # Local run on Windows (no Docker)
 ├── download.sh             # Local run on Linux/macOS
 ├── downloads/              # Output (not committed)
-├── tools/                  # binzDecrypt + osgconv (in repo)
+├── tools/
+│   ├── wasm/               # decrypt_worker.mjs + decrypt.wasm (+ cached static_key.txt)
+│   ├── binz/               # legacy binzDecrypt.exe (optional fallback)
+│   └── OsgConv/            # osgconv.exe + DLLs
 ├── LICENSE
 ├── README.md               # English docs (default on GitHub)
 └── README.ru.md            # Russian docs
@@ -646,10 +658,23 @@ docker compose run --rm downloader "https://sketchfab.com/3d-models/....."
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# Linux/macOS: sudo apt install wine64
+# Need Node.js 18+ (decrypt). Linux optional Wine for osgconv:
+#   sudo apt install nodejs wine64
 python main.py --check-tools
 python main.py "https://sketchfab.com/3d-models/....."
 # → see downloads/
 ```
+
+### Auto-updating keys
+
+You normally **do not** need to edit keys by hand:
+
+| Material | Source | Updates how? |
+|---|---|---|
+| Per-model `diter.b` | Public model embed JSON | Always live |
+| Static 40-hex key | Viewer JS on static.sketchfab.com | Extracted every download; saved to `tools/wasm/static_key.txt` |
+| `decrypt.wasm` | Embedded in viewer JS | Shipped in repo; re-extracted if missing / on decrypt failure |
+
+If Sketchfab rotates crypto and a download fails, pull the latest release or re-run the same command once (wasm/key refresh is attempted automatically).
 
 If something fails, start with `python main.py --check-tools` (or Docker equivalent) and the [FAQ](#faq--troubleshooting).

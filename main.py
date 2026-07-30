@@ -413,36 +413,124 @@ def fetch_viewer_info(uid: str) -> tuple[dict, str]:
     return data[key], embed_html
 
 
-def extract_key2(embed_html: str) -> Optional[str]:
-    """
-    Secondary decrypt material from public viewer JS (module pXZ0).
+# Built-in fallback if live extraction fails (Sketchfab rotates this periodically).
+_DEFAULT_STATIC_KEY = "7d61ef7c7530c12cf080fafd05e603d1aa3a92c6"
+_STATIC_KEY_CACHE = ROOT / "tools" / "wasm" / "static_key.txt"
+_WASM_DIR = ROOT / "tools" / "wasm"
+_WASM_FILE = _WASM_DIR / "decrypt.wasm"
+_WASM_WORKER = _WASM_DIR / "decrypt_worker.mjs"
 
-    This is NOT a user API key. It is a string from public Sketchfab JS —
-    the same material the browser viewer uses to decrypt .binz.
-    The script extracts it automatically; nothing to enter manually.
-    """
+
+def _viewer_script_urls(embed_html: str) -> list[str]:
     script_urls: list[str] = []
     for m in re.finditer(r'<script[^>]+src="([^"]+)"', embed_html):
         src = m.group(1)
         if src not in script_urls:
             script_urls.append(src)
+    script_urls.sort(
+        key=lambda u: (0 if "/static/builds/web/dist/" in u else 1, u)
+    )
+    return script_urls
 
-    # Precise patterns used by current Sketchfab builds.
+
+def _load_cached_static_key() -> Optional[str]:
+    try:
+        if _STATIC_KEY_CACHE.is_file():
+            val = _STATIC_KEY_CACHE.read_text(encoding="utf-8").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", val):
+                return val
+    except Exception:
+        pass
+    return None
+
+
+def _save_cached_static_key(key: str) -> None:
+    try:
+        _WASM_DIR.mkdir(parents=True, exist_ok=True)
+        _STATIC_KEY_CACHE.write_text(key.strip().lower() + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def ensure_wasm_module(embed_html: str, *, force: bool = False) -> bool:
+    """
+    Ensure tools/wasm/decrypt.wasm exists.
+    If missing (or force=True), extract it from current viewer JS bundles.
+    Returns True if wasm file is available afterwards.
+    """
+    if _WASM_FILE.is_file() and _WASM_FILE.stat().st_size > 10_000 and not force:
+        return True
+
+    log("  extracting decrypt.wasm from viewer bundles…")
+    _WASM_DIR.mkdir(parents=True, exist_ok=True)
+    import base64
+
+    for js_url in _viewer_script_urls(embed_html):
+        name = js_url.rstrip("/").split("/")[-1]
+        try:
+            js = http_get_text(js_url, timeout=120)
+        except Exception as e:
+            log(f"  (JS {name}: {e})")
+            continue
+        start = 0
+        while True:
+            idx = js.find("AGFzbQ", start)
+            if idx < 0:
+                break
+            q0 = js.rfind('"', 0, idx) + 1
+            end = idx
+            while end < len(js):
+                if js[end] == '"' and js[end - 1] != "\\":
+                    break
+                end += 1
+            b64 = js[q0:end].replace("\\n", "")
+            try:
+                raw = base64.b64decode(b64, validate=False)
+            except Exception:
+                start = idx + 1
+                continue
+            if raw[:4] == b"\x00asm" and len(raw) > 50_000:
+                _WASM_FILE.write_bytes(raw)
+                log(f"  decrypt.wasm saved from {name} ({len(raw)} bytes)")
+                return True
+            start = idx + 1
+    log("  WARNING: could not extract decrypt.wasm from viewer JS")
+    return _WASM_FILE.is_file()
+
+
+def extract_key2(embed_html: str) -> Optional[str]:
+    """
+    Static decrypt key from public viewer JS (auto-updated each run).
+
+    This is NOT a user API key. It is a 40-char hex string the browser viewer
+    uses together with per-model diter.b for WASM .binz decryption.
+
+    On success the key is cached to tools/wasm/static_key.txt so the next run
+    still works if Sketchfab temporarily changes JS packaging.
+    """
+    # Also refresh wasm if missing (self-healing install)
+    ensure_wasm_module(embed_html, force=False)
+
     patterns = [
-        # pXZ0:(e,t,a)=>{"use strict";a.d(t,{k:()=>n});const n="HEX\n"}
+        re.compile(
+            r'exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})(?:\\n)?"'
+        ),
+        re.compile(
+            r'\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})(?:\\n)?"'
+        ),
+        re.compile(
+            r'a\.d\(t,\{\s*k:\(\)=>\w+\s*\}\)[^"]{0,40}const\s+\w+\s*=\s*"([0-9a-f]{40})(?:\\n)?"'
+        ),
         re.compile(
             r'pXZ0:\(e,t,a\)=>\{"use strict";a\.d\(t,\{k:\(\)=>n\}\);'
             r'const n="([^"]+)"'
         ),
         re.compile(r'pXZ0:.*?const n="([^"]+)"', re.S),
-        # Older builds / minification variants
-        re.compile(
-            r'pXZ0:\(e,t,a\)=>\{[^}]*a\.d\(t,\{\s*k:\(\)=>n\s*\}\)[^"]*'
-            r'const n="([^"]+)"'
-        ),
+        re.compile(r'const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"'),
+        re.compile(r'const\s+\w+\s*=\s*"([0-9a-f]{40})"'),
     ]
 
-    for js_url in script_urls:
+    for js_url in _viewer_script_urls(embed_html):
         name = js_url.rstrip("/").split("/")[-1]
         try:
             js = http_get_text(js_url, timeout=90)
@@ -450,33 +538,54 @@ def extract_key2(embed_html: str) -> Optional[str]:
             log(f"  (JS {name}: {e})")
             continue
 
-        if "pXZ0" not in js:
-            continue
-
         for pat in patterns:
             mm = pat.search(js)
             if not mm:
                 continue
             raw = mm.group(1)
-            # JS source often stores a trailing \n as two chars: \ and n
             key2 = raw.replace("\\n", "\n").strip()
+            if re.fullmatch(r"[0-9a-f]{40}", key2, re.I):
+                key = key2.lower()
+                log(f"  static key found in {name}")
+                _save_cached_static_key(key)
+                return key
             if len(key2) >= 16:
                 log(f"  key2 found in {name} ({len(key2)} chars)")
                 return key2
 
-        # Last resort: SF_Ripper classic split near pXZ0
-        try:
-            chunk = js.split("pXZ0:", 1)[1]
-            if 'const n="' in chunk:
-                key2 = chunk.split('const n="', 1)[1].split('"', 1)[0]
-                key2 = key2.replace("\\n", "\n").strip()
-                if len(key2) >= 16:
-                    log(f"  key2 (fallback) in {name} ({len(key2)} chars)")
-                    return key2
-        except Exception:
-            pass
+        if "pXZ0" in js:
+            try:
+                chunk = js.split("pXZ0:", 1)[1]
+                if 'const n="' in chunk:
+                    key2 = chunk.split('const n="', 1)[1].split('"', 1)[0]
+                    key2 = key2.replace("\\n", "\n").strip()
+                    if re.fullmatch(r"[0-9a-f]{40}", key2, re.I):
+                        key = key2.lower()
+                        log(f"  static key (pXZ0) in {name}")
+                        _save_cached_static_key(key)
+                        return key
+                    if len(key2) >= 16:
+                        log(f"  key2 (fallback) in {name} ({len(key2)} chars)")
+                        return key2
+            except Exception:
+                pass
 
-    return None
+        # Unique 40-hex in a small module is almost always the static key
+        if len(js) < 200_000:
+            hexes = re.findall(r'["\']([0-9a-f]{40})(?:\\n)?["\']', js)
+            uniq = list(dict.fromkeys(hexes))
+            if len(uniq) == 1:
+                key = uniq[0].lower()
+                log(f"  static key (unique hex) in {name}")
+                _save_cached_static_key(key)
+                return key
+
+    cached = _load_cached_static_key()
+    if cached:
+        log("  static key not in live JS — using cached tools/wasm/static_key.txt")
+        return cached
+    log("  static key not found — using built-in fallback")
+    return _DEFAULT_STATIC_KEY
 
 
 def resolve_model_name(uid: str, viewer_info: dict) -> str:
@@ -576,7 +685,7 @@ def run_tool(cmd: list[str], cwd: Path) -> None:
                         pass
         if proc.returncode != 0:
             msg = (err or out or "").strip()
-            raise RuntimeError(f"Command exit code {proc.returncode}:\n{msg[:900]}")
+            raise RuntimeError(f"Команда код {proc.returncode}:\n{msg[:900]}")
         return
 
     proc = subprocess.run(
@@ -592,7 +701,7 @@ def run_tool(cmd: list[str], cwd: Path) -> None:
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         # 0xC0000005 = 3221225477 = ACCESS_VIOLATION (common osgconv crash)
-        raise RuntimeError(f"Command exit code {proc.returncode}:\n{err[:900]}")
+        raise RuntimeError(f"Команда код {proc.returncode}:\n{err[:900]}")
 
 
 def is_new_binz_format(viewer_info: dict) -> bool:
@@ -609,7 +718,7 @@ def is_new_binz_format(viewer_info: dict) -> bool:
 def download_model_files(viewer_info: dict, work_dir: Path, new_format: bool) -> None:
     files = viewer_info.get("files") or []
     if not files:
-        raise RuntimeError("No mesh files in viewer_info (private or broken model?).")
+        raise RuntimeError("У модели нет mesh-файлов в viewer_info (приватная/битая?).")
 
     osgjs_url = files[0]["osgjsUrl"]
     if new_format:
@@ -637,37 +746,112 @@ def download_model_files(viewer_info: dict, work_dir: Path, new_format: bool) ->
             raise
 
 
-def decrypt_binz(work_dir: Path, key1: str, key2: Optional[str]) -> None:
-    if not BINZ_DECRYPT.is_file():
-        raise FileNotFoundError(
-            f"Missing {BINZ_DECRYPT}\nRun once: python setup_tools.py"
+def _wasm_decrypt_paths() -> tuple[Optional[Path], Optional[Path]]:
+    """Return (node_script, wasm_file) if WASM decrypt tools are present."""
+    if _WASM_WORKER.is_file() and _WASM_FILE.is_file() and _WASM_FILE.stat().st_size > 10_000:
+        return _WASM_WORKER, _WASM_FILE
+    return None, None
+
+
+def _resolve_static_key(key2: Optional[str]) -> str:
+    """Prefer live/extracted key, then cache, then built-in default."""
+    if key2:
+        k = key2.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", k):
+            return k.lower()
+        if len(k) >= 16:
+            return k
+    cached = _load_cached_static_key()
+    if cached:
+        return cached
+    return _DEFAULT_STATIC_KEY
+
+
+def _decrypt_binz_wasm(work_dir: Path, key1: str, static_key: str) -> None:
+    """Decrypt all .binz in work_dir via Node + Sketchfab WASM module."""
+    worker, _wasm = _wasm_decrypt_paths()
+    if not worker:
+        raise FileNotFoundError("tools/wasm/decrypt_worker.mjs or decrypt.wasm missing")
+
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        raise RuntimeError(
+            "Node.js is required for WASM .binz decrypt.\n"
+            "Install: https://nodejs.org/  or  sudo apt install nodejs"
         )
 
-    # Auto-generated decrypt material (NOT user API keys / tokens)
-    (work_dir / "key.txt").write_text(key1, encoding="utf-8")
-    if key2:
-        # binzDecrypt reads key2.txt from the working directory
-        (work_dir / "key2.txt").write_text(key2, encoding="utf-8")
-        log("  decrypt material: key1 + key2 (both from public page)")
-    else:
-        log("  decrypt material: key1 only")
-        log("  ⚠ without key2 decryption often fails")
+    key_file = work_dir / "key.txt"
+    key_file.write_text(key1, encoding="utf-8")
+    static = _resolve_static_key(static_key)
 
+    cmd = [node, str(worker), str(work_dir), f"@{key_file}", static]
+    log(f"  $ node {worker.name} (WASM decrypt, key={static[:8]}…)")
+    proc = subprocess.run(
+        cmd,
+        cwd=str(work_dir),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "NODE_NO_WARNINGS": "1"},
+    )
+    if proc.stderr:
+        for line in proc.stderr.strip().splitlines()[-20:]:
+            log(f"  {line}")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"WASM decrypt failed (code {proc.returncode}):\n{err[:900]}")
+
+
+def decrypt_binz(
+    work_dir: Path,
+    key1: str,
+    key2: Optional[str],
+    *,
+    embed_html: Optional[str] = None,
+) -> None:
+    """
+    Decrypt Sketchfab .binz mesh files in work_dir.
+
+    Modern path: Node.js + WASM (tools/wasm/) using:
+      - key1 = per-model diter.b from viewer JSON (always live)
+      - static key = 40-hex from viewer JS (auto-extracted each run + cached)
+    Legacy path: binzDecrypt.exe via Wine (often broken on current Sketchfab).
+    """
     binz_files = sorted(work_dir.glob("*.binz"))
     if not binz_files:
         raise RuntimeError("No .binz files found after download")
 
-    # IMPORTANT: pass ONLY relative ASCII names. Absolute paths with non-ASCII
-    # (e.g. Cyrillic folders) make binzDecrypt silently do nothing.
-    for path in binz_files:
-        before = path.stat().st_size
-        log(f"  decrypt {path.name} ({before} bytes)")
-        run_tool(
-            [str(BINZ_DECRYPT), "key.txt", path.name],
-            cwd=work_dir,
+    static_key = _resolve_static_key(key2)
+    worker, _ = _wasm_decrypt_paths()
+    node_ok = bool(shutil.which("node") or shutil.which("nodejs"))
+
+    if worker and node_ok:
+        log("  decrypt: WASM (auto static key + per-model diter.b)")
+        try:
+            _decrypt_binz_wasm(work_dir, key1, static_key)
+        except Exception as e:
+            if embed_html:
+                log(f"  WASM decrypt failed ({e}); refreshing wasm + key…")
+                ensure_wasm_module(embed_html, force=True)
+                static_key = _resolve_static_key(extract_key2(embed_html))
+                _decrypt_binz_wasm(work_dir, key1, static_key)
+            else:
+                raise
+    elif BINZ_DECRYPT.is_file():
+        log("  decrypt: legacy binzDecrypt.exe (may fail on current Sketchfab)")
+        (work_dir / "key.txt").write_text(key1, encoding="utf-8")
+        (work_dir / "key2.txt").write_text(static_key, encoding="utf-8")
+        for path in binz_files:
+            log(f"  decrypt {path.name} ({path.stat().st_size} bytes)")
+            run_tool([str(BINZ_DECRYPT), "key.txt", path.name], cwd=work_dir)
+    else:
+        raise FileNotFoundError(
+            "No decrypt backend.\n"
+            "Need tools/wasm/ (decrypt_worker.mjs + decrypt.wasm) and Node.js,\n"
+            "or tools/binz/binzDecrypt.exe (+ Wine on Linux)."
         )
 
-    # binzDecrypt may replace .binz in place or emit sibling files
     produced = [
         p.name
         for p in work_dir.iterdir()
@@ -678,12 +862,10 @@ def decrypt_binz(work_dir: Path, key1: str, key2: Optional[str]) -> None:
     else:
         still = [p.name for p in work_dir.glob("*.binz")]
         raise RuntimeError(
-            "binzDecrypt did not produce .osgjs/.bin.\n"
+            "Decrypt produced no .osgjs/.bin.\n"
             f"Still present: {', '.join(still)}\n"
-            "Usually key2 was not found in viewer JS, "
-            "or tools/binz are outdated."
+            "Static key or WASM module may have changed; re-run after git pull."
         )
-
 
 def prepare_legacy_gz(work_dir: Path) -> None:
     for path in list(work_dir.glob("*.gz")):
@@ -971,7 +1153,7 @@ def download_one(
 
         if new_format:
             _progress("step:decrypt")
-            decrypt_binz(out_dir, key1, key2)
+            decrypt_binz(out_dir, key1, key2, embed_html=embed_html)
         else:
             prepare_legacy_gz(out_dir)
 
@@ -1064,28 +1246,38 @@ def download_one(
 
 def check_tools(*, quiet: bool = False) -> bool:
     ok = True
-    if not BINZ_DECRYPT.is_file():
+    node = shutil.which("node") or shutil.which("nodejs")
+    worker, wasm = _wasm_decrypt_paths()
+    if not worker or not wasm:
         if not quiet:
-            log(f"WARNING: missing {BINZ_DECRYPT}")
+            log(f"WARNING: missing WASM decrypt tools under {_WASM_DIR}")
+            log("  Expected: tools/wasm/decrypt_worker.mjs + decrypt.wasm")
+        ok = False
+    if not node:
+        if not quiet:
+            log("WARNING: Node.js not found (required for .binz decrypt)")
+            log("  Install: https://nodejs.org/  or  sudo apt install nodejs")
         ok = False
     if not OSGCONV.is_file():
         if not quiet:
-            log(f"WARNING: missing {OSGCONV}")
-        ok = False
-    if not ok and not quiet:
-        log("  Run once:  python setup_tools.py")
-        if not sys.platform.startswith("win"):
-            log("  On Linux/macOS also install Wine:  sudo apt install wine64")
+            log(f"WARNING: missing {OSGCONV} (optional if Python glTF fallback is OK)")
+            log("  Run once:  python setup_tools.py")
     if not quiet:
         curl = shutil.which("curl.exe") or shutil.which("curl")
+        log(f"node: {node or 'not found'}")
+        log(f"wasm: {'ok' if worker and wasm else 'missing'}")
         if curl:
             log(f"curl: {curl}")
         else:
             log("curl: not found (Python HTTP will be used)")
-        wine = _find_wine() if not sys.platform.startswith("win") else None
         if not sys.platform.startswith("win"):
-            log(f"wine: {wine or 'not found'}")
-    return ok
+            wine = _find_wine()
+            log(f"wine: {wine or 'not found'} (optional, for osgconv.exe)")
+        cached = _load_cached_static_key()
+        if cached:
+            log(f"cached static key: {cached[:8]}…")
+    # Node+WASM is the critical path today
+    return bool(ok and node and worker and wasm)
 
 
 def _normalize_url(raw: str) -> Optional[str]:
