@@ -38,6 +38,21 @@ IMPLICIT_HEADER_MASK_LENGTH = 1
 IMPLICIT_HEADER_EXPECTED_INDEX = 2
 IMPLICIT_HEADER_LENGTH = 3
 
+# Populated for each conversion; OSGJS may refer to a StateSet by UniqueID only.
+_STATESETS_BY_UID: dict[Any, dict] = {}
+
+
+def _collect_statesets(node: Any, states: dict[Any, dict]) -> None:
+    if isinstance(node, dict):
+        state = node.get("osg.StateSet")
+        if isinstance(state, dict) and len(state) > 1 and "UniqueID" in state:
+            states[state["UniqueID"]] = state
+        for value in node.values():
+            _collect_statesets(value, states)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_statesets(value, states)
+
 
 def _zigzag_decode(n: int) -> int:
     return (n >> 1) ^ (-(n & 1))
@@ -53,6 +68,30 @@ def _to_i32(n: int) -> int:
 
 def _to_u32(n: int) -> int:
     return n & 0xFFFFFFFF
+
+
+def _identity_matrix():
+    return [1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0]
+
+
+def _mat_mul_osg(a, b):
+    """4x4 matrix multiply. OSGJS stores matrices in column-major order (same as glTF)."""
+    c = [0.0] * 16
+    for i in range(4):
+        for j in range(4):
+            s = 0.0
+            for k in range(4):
+                s += a[k * 4 + i] * b[j * 4 + k]
+            c[j * 4 + i] = s
+    return c
+
+
+def _mat_transpose_for_gltf(m):
+    """OSGJS and glTF both store these matrices column-major; do not transpose."""
+    return list(m)
 
 
 def decode_varint(buf: bytes | memoryview, count: int, type_name: str) -> list[int]:
@@ -367,6 +406,7 @@ def decode_indices(
     prim: dict,
     user: dict,
     bin_files: dict[str, bytes],
+    highwater_seed: int = 0,
 ) -> tuple[list[int], str]:
     key = next(k for k in prim if k.startswith("DrawElements") or k.startswith("DrawArrays"))
     pe = prim[key]
@@ -407,7 +447,7 @@ def decode_indices(
         )
 
     if tri_mode & TRI_HIGHWATER:
-        values = highwater_decode(values, [0])
+        values = highwater_decode(values, [highwater_seed])
 
     return [int(v) for v in values], mode
 
@@ -415,7 +455,7 @@ def decode_indices(
 def strip_to_triangles(indices: list[int]) -> list[int]:
     """
     Expand GL TRIANGLE_STRIP to TRIANGLES.
-    Winding flips every index (including over degenerates), matching GPU behaviour.
+    Winding alternates at every index, including degenerate strip connectors.
     """
     tris: list[int] = []
     n = len(indices)
@@ -557,6 +597,8 @@ def is_transparent_geom(geom: dict) -> bool:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
     hint = str(ss.get("RenderingHint") or "")
     if "TRANSPARENT" in hint.upper():
         return True
@@ -679,6 +721,100 @@ def _is_wireframe_geom(g: dict) -> bool:
     return False
 
 
+def _walk_scene_with_transform(node: Any, parent_matrix: list[float], geoms_out: list) -> None:
+    """Recursively walk osgjs scene graph, collecting geometries with world matrices."""
+    if isinstance(node, list):
+        for item in node:
+            _walk_scene_with_transform(item, parent_matrix, geoms_out)
+        return
+    if not isinstance(node, dict):
+        return
+
+    local_matrix = _identity_matrix()
+    children: list[Any] = []
+
+    for key, value in node.items():
+        if not key.startswith("osg."):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if key == "osg.MatrixTransform" and "Matrix" in value:
+            local_matrix = value["Matrix"]
+        if "Children" in value:
+            children = value["Children"]
+        if key == "osg.Geometry":
+            if value.get("VertexAttributeList") and not _is_wireframe_geom(value):
+                geoms_out.append((value, parent_matrix))
+
+    world = _mat_mul_osg(parent_matrix, local_matrix)
+    for child in children:
+        _walk_scene_with_transform(child, world, geoms_out)
+
+
+def _parse_stateset(geom: dict) -> tuple[dict, list[dict], dict[str, int]]:
+    """Parse osg.StateSet into (material, textures, semantics)."""
+    ss = geom.get("StateSet") or {}
+    if "osg.StateSet" in ss:
+        ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
+
+    material: dict[str, Any] = {
+        "name": "",
+        "diffuse": [0.588, 0.588, 0.588, 1.0],
+        "ambient": [0.588, 0.588, 0.588, 1.0],
+        "emission": [0.0, 0.0, 0.0, 1.0],
+        "specular": [0.0, 0.0, 0.0, 1.0],
+        "shininess": 0.0,
+    }
+
+    for entry in ss.get("AttributeList") or []:
+        if not isinstance(entry, dict):
+            continue
+        mat = entry.get("osg.Material")
+        if isinstance(mat, dict):
+            material["name"] = str(mat.get("Name", ""))
+            material["diffuse"] = mat.get("Diffuse", material["diffuse"])
+            material["ambient"] = mat.get("Ambient", material["ambient"])
+            material["emission"] = mat.get("Emission", material["emission"])
+            material["specular"] = mat.get("Specular", material["specular"])
+            material["shininess"] = float(mat.get("Shininess", 0))
+
+    textures: list[dict] = []
+    tal = ss.get("TextureAttributeList") or []
+    for unit, unit_entries in enumerate(tal):
+        if not isinstance(unit_entries, list):
+            unit_entries = [unit_entries]
+        for entry in unit_entries:
+            if not isinstance(entry, dict):
+                continue
+            tex = entry.get("osg.Texture") or entry.get("osg.Texture2D")
+            if isinstance(tex, dict):
+                textures.append({
+                    "file": str(tex.get("File", "")),
+                    "unit": unit,
+                    "mag_filter": tex.get("MagFilter", "LINEAR"),
+                    "min_filter": tex.get("MinFilter", "LINEAR_MIPMAP_LINEAR"),
+                    "wrap_s": tex.get("WrapS", "REPEAT"),
+                    "wrap_t": tex.get("WrapT", "REPEAT"),
+                })
+
+    semantics: dict[str, int] = {}
+    udc = ss.get("UserDataContainer") or {}
+    if "osg.UserDataContainer" in udc:
+        udc = udc["osg.UserDataContainer"]
+    for item in udc.get("Values") or []:
+        name = item.get("Name", "")
+        val = item.get("Value", "")
+        if name in ("sDiffuse", "sEmissive", "sOpacity", "sSpecular", "sNormal", "sBump"):
+            try:
+                semantics[name] = int(val)
+            except (ValueError, TypeError):
+                pass
+
+    return material, textures, semantics
+
+
 def _walk_geometries(node: Any, out: list[dict], *, _seen: Optional[set] = None) -> None:
     """Collect unique renderable geometries; prefer RigGeometry.SourceGeometry once."""
     if _seen is None:
@@ -730,6 +866,8 @@ def _extract_diffuse_texture(geom: dict) -> Optional[str]:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
     tal = ss.get("TextureAttributeList") or []
     for unit in tal:
         if not isinstance(unit, list):
@@ -748,6 +886,8 @@ def _extract_material_name(geom: dict, fallback: str) -> str:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
     for entry in ss.get("AttributeList") or []:
         if isinstance(entry, dict) and "osg.Material" in entry:
             mat = entry["osg.Material"]
@@ -761,6 +901,30 @@ def _rel_tex(path: Path, work_dir: Path) -> str:
         return str(path.relative_to(work_dir)).replace("\\", "/")
     except ValueError:
         return path.name
+
+
+def _build_texture_uid_map(work_dir: Path) -> dict[str, str]:
+    """Build uid -> relative_path map by scanning textures/ directory.
+
+    Sketchfab downloads name files as {uid}_{original_name}.ext,
+    while osgjs references them as textures/{uid}/{hash}.ext.
+    We extract the leading uid from the filename to match.
+    """
+    mapping: dict[str, str] = {}
+    tex_dir = work_dir / "textures"
+    if not tex_dir.is_dir():
+        return mapping
+    for p in tex_dir.iterdir():
+        if not p.is_file():
+            continue
+        # uid is the first 32-hex block in the filename
+        m = re.match(r"([a-f0-9]{32})", p.name)
+        if m:
+            uid = m.group(1)
+            # Keep the first match; filenames are unique per uid in practice
+            if uid not in mapping:
+                mapping[uid] = _rel_tex(p, work_dir)
+    return mapping
 
 
 def _resolve_texture_file(
@@ -848,17 +1012,21 @@ def convert_osgjs(
         raise FileNotFoundError(f"No file.osgjs in {work_dir}")
 
     scene = json.loads(osgjs_path.read_text(encoding="utf-8"))
+    _STATESETS_BY_UID.clear()
+    _collect_statesets(scene, _STATESETS_BY_UID)
     bins = _load_bins(work_dir)
     if not bins:
         raise FileNotFoundError("No .bin buffers next to file.osgjs")
 
-    geoms: list[dict] = []
-    _walk_geometries(scene, geoms)
-    if not geoms:
+    # Use scene-graph traversal to preserve transforms and StateSets
+    scene_items: list[dict] = []
+    _walk_scene_with_transform(scene, _identity_matrix(), scene_items)
+    if not scene_items:
         raise RuntimeError("No osg.Geometry found in file.osgjs")
 
     meshes: list[dict] = []
-    for gi, g in enumerate(geoms):
+    for ii, item in enumerate(scene_items):
+        g, world_matrix = item
         try:
             user = parse_user_data(g.get("UserDataContainer"))
             valist = g.get("VertexAttributeList") or {}
@@ -868,14 +1036,16 @@ def convert_osgjs(
             prims = g.get("PrimitiveSetList") or []
             all_tri: list[int] = []
             predict_idx: Optional[list[int]] = None
+            highwater_next = 0
             for pi, prim in enumerate(prims):
                 try:
-                    idx, mode = decode_indices(prim, user, bins)
+                    idx, mode = decode_indices(prim, user, bins, highwater_next)
                 except Exception:
                     continue
-                if predict_idx is None:
-                    predict_idx = list(idx)
                 if mode == "TRIANGLE_STRIP":
+                    highwater_next = max(idx, default=-1) + 1
+                    if predict_idx is None:
+                        predict_idx = list(idx)
                     tris = strip_to_triangles(idx)
                 elif mode == "TRIANGLES":
                     tris = idx
@@ -894,10 +1064,7 @@ def convert_osgjs(
             all_tri = _filter_tris(all_tri, n_verts)
             if not all_tri:
                 continue
-            # Drop only extreme decode spikes (keep long thin real geometry like weapons/hair)
-            all_tri = filter_spike_tris(positions, all_tri, max_edge_factor=80.0)
-            if not all_tri:
-                continue
+            # Preserve decoded triangles; the spike heuristic can remove genuine hall surfaces.
 
             uvs = None
             if "TexCoord0" in valist and valist["TexCoord0"].get("Array"):
@@ -936,7 +1103,7 @@ def convert_osgjs(
             if normals is None:
                 normals = recalc_vertex_normals(positions, all_tri)
 
-            mat_name = _extract_material_name(g, f"mat_{gi}")
+            mat_name = _extract_material_name(g, f"mat_{ii}")
             tex_ref = _extract_diffuse_texture(g)
             tex_rel = _resolve_texture_file(
                 tex_ref or "",
@@ -945,15 +1112,21 @@ def convert_osgjs(
                 material_name=mat_name,
             )
 
+            material, textures, semantics = _parse_stateset(g)
+
             meshes.append(
                 {
-                    "name": str(g.get("Name") or f"mesh_{gi}"),
+                    "name": str(g.get("Name") or f"mesh_{ii}"),
                     "positions": positions,
                     "normals": normals,
                     "uvs": uvs,
                     "indices": all_tri,
-                    "material": re.sub(r"[^\w\-]+", "_", mat_name)[:64] or f"mat_{gi}",
+                    "material": re.sub(r"[^\w\-]+", "_", mat_name)[:64] or f"mat_{ii}",
                     "texture": tex_rel,
+                    "matrix": world_matrix,
+                    "material_data": material,
+                    "texture_data": textures,
+                    "semantic_data": semantics,
                 }
             )
         except Exception:
@@ -963,7 +1136,7 @@ def convert_osgjs(
         raise RuntimeError("No mesh data could be decoded from osgjs")
 
     if prefer == "gltf":
-        return _write_gltf(work_dir, model_name, meshes)
+        return _write_gltf(work_dir, model_name, meshes, texture_map)
     return _write_obj(work_dir, model_name, meshes)
 
 
@@ -1050,20 +1223,52 @@ def _write_obj(work_dir: Path, model_name: str, meshes: list[dict]) -> Path:
     return obj_path
 
 
-def _write_gltf(work_dir: Path, model_name: str, meshes: list[dict]) -> Path:
-    """Minimal embedded glTF (no textures) — kept as secondary option."""
+def _write_gltf(
+    work_dir: Path,
+    model_name: str,
+    items: list[dict],
+    texture_map: Optional[dict[str, Path]],
+) -> Path:
+    """Full glTF 2.0 export with transforms, materials and external textures."""
     import array
-    import base64
 
     blob = bytearray()
     accessors: list[dict] = []
     buffer_views: list[dict] = []
     gl_meshes: list[dict] = []
     nodes: list[dict] = []
+    materials: list[dict] = []
+    textures: list[dict] = []
+    images: list[dict] = []
+    samplers: list[dict] = []
+
+    _FILTER_MAP = {"LINEAR": 9729, "NEAREST": 9728}
+    _MIN_FILTER_MAP = {
+        "LINEAR": 9729,
+        "LINEAR_MIPMAP_LINEAR": 9987,
+        "LINEAR_MIPMAP_NEAREST": 9985,
+        "NEAREST_MIPMAP_LINEAR": 9986,
+        "NEAREST_MIPMAP_NEAREST": 9984,
+        "NEAREST": 9728,
+    }
+    _WRAP_MAP = {
+        "REPEAT": 10497,
+        "CLAMP_TO_EDGE": 33071,
+        "CLAMP": 33071,
+        "MIRRORED_REPEAT": 33648,
+    }
+
+    uid_map = _build_texture_uid_map(work_dir)
+    manifest_path = work_dir / "textures_corrected_manifest.json"
+    corrected_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+
+    def _align(n: int) -> int:
+        while len(blob) % n:
+            blob.append(0)
+        return len(blob)
 
     def add_f32(data: list[float], item_size: int) -> int:
-        while len(blob) % 4:
-            blob.append(0)
+        _align(4)
         offset = len(blob)
         raw = array.array("f", data).tobytes()
         blob.extend(raw)
@@ -1081,8 +1286,7 @@ def _write_gltf(work_dir: Path, model_name: str, meshes: list[dict]) -> Path:
         return ai
 
     def add_u32(data: list[int]) -> int:
-        while len(blob) % 4:
-            blob.append(0)
+        _align(4)
         offset = len(blob)
         raw = array.array("I", data).tobytes()
         blob.extend(raw)
@@ -1092,31 +1296,201 @@ def _write_gltf(work_dir: Path, model_name: str, meshes: list[dict]) -> Path:
         accessors.append({"bufferView": bv, "componentType": 5125, "count": len(data), "type": "SCALAR"})
         return ai
 
-    for mi, m in enumerate(meshes):
-        attrs = {"POSITION": add_f32(m["positions"], 3)}
-        if m["normals"]:
-            attrs["NORMAL"] = add_f32(m["normals"], 3)
-        if m["uvs"]:
-            attrs["TEXCOORD_0"] = add_f32(m["uvs"], 2)
-        gl_meshes.append({
-            "name": m["name"],
-            "primitives": [{"attributes": attrs, "indices": add_u32(m["indices"]), "mode": 4}],
-        })
-        nodes.append({"mesh": mi, "name": m["name"]})
+    # Deduplication caches
+    mat_cache: dict[str, int] = {}
+    tex_cache: dict[str, int] = {}
+    smp_cache: dict[str, int] = {}
 
-    b64 = base64.b64encode(bytes(blob)).decode("ascii")
-    gltf = {
-        "asset": {"version": "2.0", "generator": "sketchfab-dl-pure-python"},
-        "buffers": [{"byteLength": len(blob), "uri": f"data:application/octet-stream;base64,{b64}"}],
-        "bufferViews": buffer_views,
-        "accessors": accessors,
-        "meshes": gl_meshes,
-        "nodes": nodes,
-        "scenes": [{"nodes": list(range(len(nodes)))}],
+    def get_or_create_sampler(mag: str, min_f: str, wrap_s: str, wrap_t: str) -> int:
+        key = f"{mag}|{min_f}|{wrap_s}|{wrap_t}"
+        if key in smp_cache:
+            return smp_cache[key]
+        idx = len(samplers)
+        samplers.append({
+            "magFilter": _FILTER_MAP.get(mag, 9729),
+            "minFilter": _MIN_FILTER_MAP.get(min_f, 9729),
+            "wrapS": _WRAP_MAP.get(wrap_s, 10497),
+            "wrapT": _WRAP_MAP.get(wrap_t, 10497),
+        })
+        smp_cache[key] = idx
+        return idx
+
+    def resolve_tex_path(tex_info: dict) -> Optional[str]:
+        file_path = tex_info.get("file", "")
+        if not file_path:
+            return None
+        if file_path in corrected_manifest:
+            corrected = work_dir / corrected_manifest[file_path]
+            if not corrected.is_file():
+                raise FileNotFoundError(corrected)
+            return _rel_tex(corrected, work_dir)
+        # 1. Try uid map (most reliable for Sketchfab downloads)
+        uid_m = re.search(r"([a-f0-9]{32})", file_path.replace("\\", "/"))
+        if uid_m:
+            uid = uid_m.group(1)
+            if uid in uid_map:
+                return uid_map[uid]
+        # 2. Try exact relative path
+        direct = work_dir / file_path
+        if direct.is_file():
+            return _rel_tex(direct, work_dir)
+        # 3. Try texture_map
+        if texture_map:
+            base = Path(file_path).name
+            if base in texture_map:
+                return _rel_tex(texture_map[base], work_dir)
+            if uid_m and uid_m.group(1) in texture_map:
+                return _rel_tex(texture_map[uid_m.group(1)], work_dir)
+        # 4. Fallback: search textures/ by uid
+        tex_dir = work_dir / "textures"
+        if tex_dir.is_dir() and uid_m:
+            for p in tex_dir.glob(f"{uid_m.group(1)}*"):
+                if p.is_file():
+                    return _rel_tex(p, work_dir)
+        return None
+
+    def get_or_create_texture(tex_info: dict) -> Optional[int]:
+        resolved = resolve_tex_path(tex_info)
+        if not resolved:
+            return None
+        if resolved in tex_cache:
+            return tex_cache[resolved]
+        img_idx = len(images)
+        images.append({"uri": resolved})
+        smp_idx = get_or_create_sampler(
+            tex_info.get("mag_filter", "LINEAR"),
+            tex_info.get("min_filter", "LINEAR_MIPMAP_LINEAR"),
+            tex_info.get("wrap_s", "REPEAT"),
+            tex_info.get("wrap_t", "REPEAT"),
+        )
+        tex_idx = len(textures)
+        textures.append({"source": img_idx, "sampler": smp_idx})
+        tex_cache[resolved] = tex_idx
+        return tex_idx
+
+    def get_or_create_material(item: dict) -> int:
+        mat = item["material_data"]
+        mat_name = mat.get("name", "") or item.get("name", "mat")
+        if mat_name in mat_cache:
+            return mat_cache[mat_name]
+
+        diffuse = mat.get("diffuse", [0.588, 0.588, 0.588, 1.0])
+        emission = mat.get("emission", [0.0, 0.0, 0.0, 1.0])
+
+        gl_mat: dict[str, Any] = {
+            "name": mat_name,
+            "pbrMetallicRoughness": {
+                "baseColorFactor": diffuse[:4] if len(diffuse) >= 4 else [*diffuse[:3], 1.0],
+                "metallicFactor": 0.0,
+                "roughnessFactor": 1.0,
+            },
+            "emissiveFactor": emission[:3] if len(emission) >= 3 else [0.0, 0.0, 0.0],
+        }
+
+        if len(diffuse) >= 4 and diffuse[3] < 1.0:
+            gl_mat["alphaMode"] = "BLEND"
+
+        semantics = item.get("semantic_data", {})
+        all_textures = item.get("texture_data", [])
+
+        # Diffuse / baseColor
+        diff_unit = semantics.get("sDiffuse", 0)
+        diff_tex = None
+        for t in all_textures:
+            if t.get("unit") == diff_unit:
+                diff_tex = get_or_create_texture(t)
+                break
+        if diff_tex is None and all_textures:
+            diff_tex = get_or_create_texture(all_textures[0])
+
+        if diff_tex is not None:
+            gl_mat["pbrMetallicRoughness"]["baseColorTexture"] = {"index": diff_tex}
+
+        # Emissive
+        emi_unit = semantics.get("sEmissive")
+        if emi_unit is not None:
+            for t in all_textures:
+                if t.get("unit") == emi_unit:
+                    emi_tex = get_or_create_texture(t)
+                    if emi_tex is not None:
+                        gl_mat["emissiveTexture"] = {"index": emi_tex}
+                    break
+
+        # Opacity implies BLEND
+        op_unit = semantics.get("sOpacity")
+        if op_unit is not None and op_unit != diff_unit:
+            gl_mat["alphaMode"] = "BLEND"
+            # If there is an opacity texture on a different unit, we can't easily
+            # pack it into baseColor alpha without image processing. Just mark BLEND.
+
+        idx = len(materials)
+        materials.append(gl_mat)
+        mat_cache[mat_name] = idx
+        return idx
+
+    for mi, item in enumerate(items):
+        attrs: dict[str, int] = {"POSITION": add_f32(item["positions"], 3)}
+        if item.get("normals"):
+            attrs["NORMAL"] = add_f32(item["normals"], 3)
+        if item.get("uvs"):
+            # OSG/WebGL uses bottom-left UV origin; glTF 2.0 uses top-left.
+            uvs = list(item["uvs"])
+            for i in range(1, len(uvs), 2):
+                uvs[i] = 1.0 - uvs[i]
+            attrs["TEXCOORD_0"] = add_f32(uvs, 2)
+
+        mat_idx = get_or_create_material(item)
+
+        gl_meshes.append({
+            "name": item.get("name", f"mesh_{mi}"),
+            "primitives": [{
+                "attributes": attrs,
+                "indices": add_u32(item["indices"]),
+                "mode": 4,
+                "material": mat_idx,
+            }],
+        })
+
+        node: dict[str, Any] = {
+            "name": item.get("name", f"node_{mi}"),
+            "mesh": mi,
+        }
+        matrix = item.get("matrix")
+        if matrix:
+            # OSGJS matrices are already column-major (same as glTF); no transpose needed
+            ident = _identity_matrix()
+            if any(abs(matrix[i] - ident[i]) > 1e-6 for i in range(16)):
+                node["matrix"] = matrix
+        nodes.append(node)
+
+    # Write external .bin
+    bin_name = f"{model_name}.bin"
+    bin_path = work_dir / bin_name
+    bin_path.write_bytes(bytes(blob))
+
+    gltf: dict[str, Any] = {
+        "asset": {"version": "2.0", "generator": "sketchfab-dl-full-gltf"},
         "scene": 0,
+        "scenes": [{"nodes": list(range(len(nodes)))}],
+        "nodes": nodes,
+        "meshes": gl_meshes,
     }
+
+    if materials:
+        gltf["materials"] = materials
+    if textures:
+        gltf["textures"] = textures
+    if images:
+        gltf["images"] = images
+    if samplers:
+        gltf["samplers"] = samplers
+
+    gltf["accessors"] = accessors
+    gltf["bufferViews"] = buffer_views
+    gltf["buffers"] = [{"uri": bin_name, "byteLength": len(blob)}]
+
     out = work_dir / f"{model_name}.gltf"
-    out.write_text(json.dumps(gltf), encoding="utf-8")
+    out.write_text(json.dumps(gltf, indent=2), encoding="utf-8")
     return out
 
 
