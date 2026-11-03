@@ -38,6 +38,21 @@ IMPLICIT_HEADER_MASK_LENGTH = 1
 IMPLICIT_HEADER_EXPECTED_INDEX = 2
 IMPLICIT_HEADER_LENGTH = 3
 
+# Populated for each conversion; OSGJS may refer to a StateSet by UniqueID only.
+_STATESETS_BY_UID: dict[Any, dict] = {}
+
+
+def _collect_statesets(node: Any, states: dict[Any, dict]) -> None:
+    if isinstance(node, dict):
+        state = node.get("osg.StateSet")
+        if isinstance(state, dict) and len(state) > 1 and "UniqueID" in state:
+            states[state["UniqueID"]] = state
+        for value in node.values():
+            _collect_statesets(value, states)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_statesets(value, states)
+
 
 def _zigzag_decode(n: int) -> int:
     return (n >> 1) ^ (-(n & 1))
@@ -63,23 +78,20 @@ def _identity_matrix():
 
 
 def _mat_mul_osg(a, b):
-    """4x4 matrix multiply in OSG row-vector convention (v * A * B = v * C)."""
+    """4x4 matrix multiply. OSGJS stores matrices in column-major order (same as glTF)."""
     c = [0.0] * 16
     for i in range(4):
         for j in range(4):
             s = 0.0
             for k in range(4):
-                s += a[i * 4 + k] * b[k * 4 + j]
-            c[i * 4 + j] = s
+                s += a[k * 4 + i] * b[j * 4 + k]
+            c[j * 4 + i] = s
     return c
 
 
 def _mat_transpose_for_gltf(m):
-    """Convert OSG row-major matrix to glTF column-major 16-element list."""
-    return [m[0], m[4], m[8], m[12],
-            m[1], m[5], m[9], m[13],
-            m[2], m[6], m[10], m[14],
-            m[3], m[7], m[11], m[15]]
+    """OSGJS and glTF both store these matrices column-major; do not transpose."""
+    return list(m)
 
 
 def decode_varint(buf: bytes | memoryview, count: int, type_name: str) -> list[int]:
@@ -394,6 +406,7 @@ def decode_indices(
     prim: dict,
     user: dict,
     bin_files: dict[str, bytes],
+    highwater_seed: int = 0,
 ) -> tuple[list[int], str]:
     key = next(k for k in prim if k.startswith("DrawElements") or k.startswith("DrawArrays"))
     pe = prim[key]
@@ -434,7 +447,7 @@ def decode_indices(
         )
 
     if tri_mode & TRI_HIGHWATER:
-        values = highwater_decode(values, [0])
+        values = highwater_decode(values, [highwater_seed])
 
     return [int(v) for v in values], mode
 
@@ -442,7 +455,7 @@ def decode_indices(
 def strip_to_triangles(indices: list[int]) -> list[int]:
     """
     Expand GL TRIANGLE_STRIP to TRIANGLES.
-    Winding flips every index (including over degenerates), matching GPU behaviour.
+    Winding alternates at every index, including degenerate strip connectors.
     """
     tris: list[int] = []
     n = len(indices)
@@ -584,6 +597,8 @@ def is_transparent_geom(geom: dict) -> bool:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
     hint = str(ss.get("RenderingHint") or "")
     if "TRANSPARENT" in hint.upper():
         return True
@@ -741,6 +756,8 @@ def _parse_stateset(geom: dict) -> tuple[dict, list[dict], dict[str, int]]:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
 
     material: dict[str, Any] = {
         "name": "",
@@ -849,6 +866,8 @@ def _extract_diffuse_texture(geom: dict) -> Optional[str]:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
     tal = ss.get("TextureAttributeList") or []
     for unit in tal:
         if not isinstance(unit, list):
@@ -867,6 +886,8 @@ def _extract_material_name(geom: dict, fallback: str) -> str:
     ss = geom.get("StateSet") or {}
     if "osg.StateSet" in ss:
         ss = ss["osg.StateSet"]
+    if isinstance(ss, dict) and set(ss) == {"UniqueID"}:
+        ss = _STATESETS_BY_UID.get(ss["UniqueID"], ss)
     for entry in ss.get("AttributeList") or []:
         if isinstance(entry, dict) and "osg.Material" in entry:
             mat = entry["osg.Material"]
@@ -991,6 +1012,8 @@ def convert_osgjs(
         raise FileNotFoundError(f"No file.osgjs in {work_dir}")
 
     scene = json.loads(osgjs_path.read_text(encoding="utf-8"))
+    _STATESETS_BY_UID.clear()
+    _collect_statesets(scene, _STATESETS_BY_UID)
     bins = _load_bins(work_dir)
     if not bins:
         raise FileNotFoundError("No .bin buffers next to file.osgjs")
@@ -1013,14 +1036,16 @@ def convert_osgjs(
             prims = g.get("PrimitiveSetList") or []
             all_tri: list[int] = []
             predict_idx: Optional[list[int]] = None
+            highwater_next = 0
             for pi, prim in enumerate(prims):
                 try:
-                    idx, mode = decode_indices(prim, user, bins)
+                    idx, mode = decode_indices(prim, user, bins, highwater_next)
                 except Exception:
                     continue
-                if predict_idx is None:
-                    predict_idx = list(idx)
                 if mode == "TRIANGLE_STRIP":
+                    highwater_next = max(idx, default=-1) + 1
+                    if predict_idx is None:
+                        predict_idx = list(idx)
                     tris = strip_to_triangles(idx)
                 elif mode == "TRIANGLES":
                     tris = idx
@@ -1039,10 +1064,7 @@ def convert_osgjs(
             all_tri = _filter_tris(all_tri, n_verts)
             if not all_tri:
                 continue
-            # Drop only extreme decode spikes (keep long thin real geometry like weapons/hair)
-            all_tri = filter_spike_tris(positions, all_tri, max_edge_factor=80.0)
-            if not all_tri:
-                continue
+            # Preserve decoded triangles; the spike heuristic can remove genuine hall surfaces.
 
             uvs = None
             if "TexCoord0" in valist and valist["TexCoord0"].get("Array"):
@@ -1237,6 +1259,8 @@ def _write_gltf(
     }
 
     uid_map = _build_texture_uid_map(work_dir)
+    manifest_path = work_dir / "textures_corrected_manifest.json"
+    corrected_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
 
     def _align(n: int) -> int:
         while len(blob) % n:
@@ -1295,6 +1319,11 @@ def _write_gltf(
         file_path = tex_info.get("file", "")
         if not file_path:
             return None
+        if file_path in corrected_manifest:
+            corrected = work_dir / corrected_manifest[file_path]
+            if not corrected.is_file():
+                raise FileNotFoundError(corrected)
+            return _rel_tex(corrected, work_dir)
         # 1. Try uid map (most reliable for Sketchfab downloads)
         uid_m = re.search(r"([a-f0-9]{32})", file_path.replace("\\", "/"))
         if uid_m:
@@ -1428,11 +1457,10 @@ def _write_gltf(
         }
         matrix = item.get("matrix")
         if matrix:
-            gltf_mat = _mat_transpose_for_gltf(matrix)
-            # Only write if not identity
+            # OSGJS matrices are already column-major (same as glTF); no transpose needed
             ident = _identity_matrix()
-            if any(abs(gltf_mat[i] - ident[i]) > 1e-6 for i in range(16)):
-                node["matrix"] = gltf_mat
+            if any(abs(matrix[i] - ident[i]) > 1e-6 for i in range(16)):
+                node["matrix"] = matrix
         nodes.append(node)
 
     # Write external .bin
