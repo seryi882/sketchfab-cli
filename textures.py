@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional
+from PIL import Image
 
 Progress = Optional[Callable[[str], None]]
 
@@ -25,24 +27,49 @@ def fetch_texture_manifest(uid: str, http_get_json) -> list[dict]:
     return list(data.get("results") or [])
 
 
-def _best_image(images: list[dict]) -> Optional[dict]:
-    if not images:
-        return None
+def _texture_variants(images: list[dict]) -> list[dict]:
+    usable = []
+    for image in images:
+        url = image.get("url")
+        if not url:
+            continue
+        width, height = int(image.get("width") or 0), int(image.get("height") or 0)
+        key, version = image.get("pk"), image.get("pv")
+        if key is not None or version is not None:
+            if key is None or version != 1 or width <= 0 or height <= 0 or width % 8 or height % 8:
+                continue
+        usable.append(image)
+    return sorted(usable, key=lambda image: (
+        int(image.get("width") or 0) * int(image.get("height") or 0),
+        int(image.get("size") or 0),
+    ), reverse=True)
 
-    def score(img: dict) -> int:
-        w = int(img.get("width") or 0)
-        h = int(img.get("height") or 0)
-        size = int(img.get("size") or 0)
-        return size or (w * h)
 
-    # Prefer power-of-two full maps (skip tiny thumbs)
-    usable = [
-        i
-        for i in images
-        if int(i.get("width") or 0) >= 64 and int(i.get("height") or 0) >= 64
-    ]
-    pool = usable or images
-    return max(pool, key=score)
+def _decode_viewer_image(image: Image.Image, key: int) -> Image.Image:
+    """Restore v1 viewer tiles using the layout documented by Sketchfab Local."""
+    mode = "RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB"
+    source = image.convert(mode)
+    result = Image.new(mode, source.size)
+    columns, rows = source.width // 8, source.height // 8
+    positions = []
+    for diagonal in range(columns + rows - 1):
+        columns_on_diagonal = range(max(0, diagonal - rows + 1), min(columns, diagonal + 1))
+        if diagonal % 2:
+            columns_on_diagonal = reversed(columns_on_diagonal)
+        positions.extend((8 * x, 8 * (diagonal - x)) for x in columns_on_diagonal)
+
+    forward = (None, Image.Transpose.FLIP_LEFT_RIGHT, Image.Transpose.TRANSPOSE, Image.Transpose.ROTATE_270)
+    inverse = (None, Image.Transpose.FLIP_LEFT_RIGHT, Image.Transpose.TRANSPOSE, Image.Transpose.ROTATE_90)
+    for output_index, position in enumerate(positions):
+        input_index = (output_index - key) % len(positions)
+        x, y = positions[input_index]
+        tile = source.crop((x, y, x + 8, y + 8))
+        if (operation := forward[input_index % 4]) is not None:
+            tile = tile.transpose(operation)
+        if (operation := inverse[output_index % 4]) is not None:
+            tile = tile.transpose(operation)
+        result.paste(tile, position)
+    return result
 
 
 def _safe_name(name: str) -> str:
@@ -77,31 +104,50 @@ def download_textures(
     for i, tex in enumerate(results, start=1):
         tuid = str(tex.get("uid") or "")
         name = _safe_name(str(tex.get("name") or tuid or f"tex_{i}"))
-        img = _best_image(list(tex.get("images") or []))
-        if not img or not img.get("url"):
+        variants = _texture_variants(list(tex.get("images") or []))
+        if not variants:
             _log(progress, f"step:tex_skip|{name}")
             continue
-        url = img["url"]
-        # keep extension from url or name
-        ext = Path(name).suffix.lower()
-        if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-            url_ext = Path(url.split("?", 1)[0]).suffix.lower()
-            ext = url_ext if url_ext in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
-            if not name.lower().endswith(ext):
-                name = f"{name}{ext}"
-        # Sketchfab-like filename used by some pipelines
-        fname = f"{tuid}_{name}" if tuid else name
-        dest = out_dir / fname
-        try:
-            _log(progress, f"step:tex_item|{i}|{len(results)}|{name}")
-            download_file(url, dest)
+
+        _log(progress, f"step:tex_item|{i}|{len(results)}|{name}")
+        for variant in variants:
+            url = variant["url"]
+            try:
+                with tempfile.TemporaryDirectory(dir=out_dir) as temporary:
+                    raw = Path(temporary) / "download"
+                    download_file(url, raw)
+                    with Image.open(raw) as image:
+                        image.load()
+                        expected = (variant.get("width"), variant.get("height"))
+                        if all(expected) and image.size != tuple(map(int, expected)):
+                            raise ValueError(f"Expected {expected}, received {image.size}")
+                        key = variant.get("pk")
+                        if key is not None:
+                            decoded = _decode_viewer_image(image, int(key))
+                            prepared = Path(temporary) / "decoded.png"
+                            decoded.save(prepared)
+                            extension = ".png"
+                        else:
+                            actual_suffix = {"JPEG": ".jpeg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}
+                            extension = actual_suffix.get(image.format, "")
+                            if not extension:
+                                prepared = Path(temporary) / "decoded.png"
+                                image.convert("RGBA").save(prepared)
+                                extension = ".png"
+                            else:
+                                prepared = raw
+                    filename = Path(name).stem + extension
+                    dest = out_dir / (f"{tuid}_{filename}" if tuid else filename)
+                    prepared.replace(dest)
+            except (OSError, RuntimeError, ValueError) as error:
+                _log(progress, f"step:tex_fail|{name}|{error}")
+                continue
             if tuid:
                 mapping[tuid] = dest
             mapping[name] = dest
-            mapping[fname] = dest
+            mapping[filename] = dest
             mapping[dest.name] = dest
-        except Exception as e:
-            _log(progress, f"step:tex_fail|{name}|{e}")
+            break
 
     # also write manifest
     (out_dir / "textures_manifest.json").write_text(
@@ -109,7 +155,7 @@ def download_textures(
             {
                 "uid": uid,
                 "count": len(results),
-                "files": [p.name for p in out_dir.glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}],
+                "files": sorted({path.name for path in mapping.values()}),
             },
             ensure_ascii=False,
             indent=2,

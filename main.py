@@ -7,7 +7,7 @@ Download public Sketchfab 3D models without an account or API keys.
 Works for models that have no official Download button (uses the same
 mesh data the public 3D viewer loads in the browser).
 
-Output: glTF (+ textures when available) in the downloads/ folder.
+Output: GLB (+ textures when available) in the downloads/ folder.
 
 Local key.txt / key2.txt written during decrypt are NOT API keys —
 they are one-time mesh decryption material taken from the public page.
@@ -287,6 +287,8 @@ def http_get_bytes(url: str, *, timeout: int = 180, label: str = "") -> bytes:
         for name, fn in backends:
             try:
                 data = fn()
+                if not data:
+                    raise ValueError(f"{name} returned an empty response")
                 if attempt > 1 or name != "requests":
                     tag = f" ({name}, attempt {attempt})" if label else f" via {name}"
                     if label:
@@ -993,12 +995,8 @@ def convert_to_model(
     """
     Convert decrypted Sketchfab mesh to a Blender-friendly format.
 
-    Primary path (original working pipeline):
-      binzDecrypt → osgconv → glTF  (same as first successful version)
-
-    Fallbacks if osgconv crashes:
-      1) osgconv in short ASCII temp directory
-      2) package raw decrypted files (file.osgjs + *.bin) for manual convert
+    Use the Python exporter for an explicit texture selection. Otherwise try
+    osgconv first, with the Python exporter and raw scene files as fallbacks.
     """
     osgjs = ensure_osgjs_present(work_dir)
     _prepare_osgjs_refs(work_dir, osgjs)
@@ -1006,8 +1004,35 @@ def convert_to_model(
     out_gltf = work_dir / f"{model_name}.gltf"
     errors: list[str] = []
 
+    def convert_with_texture_map() -> Optional[Path]:
+        try:
+            from osgjs_convert import convert_osgjs
+
+            _progress("step:convert")
+            result = convert_osgjs(
+                work_dir,
+                model_name,
+                prefer="gltf",
+                texture_map=texture_map,
+                weld=False,
+                double_sided=False,
+            )
+            if result.is_file() and result.stat().st_size > 0:
+                _progress(f"step:export|{result.name}|{result.stat().st_size}")
+                return result
+            return None
+        except Exception as e:
+            errors.append(f"python-gltf: {e}")
+            _progress(f"step:convert_fail|{e}")
+            return None
+
+    if texture_map is not None:
+        result = convert_with_texture_map()
+        if result is not None:
+            return result
+
     # --- 1) Direct osgconv (original recipe) ---
-    if OSGCONV.is_file():
+    if texture_map is None and OSGCONV.is_file():
         try:
             _progress("step:convert")
             _run_osgconv(work_dir, osgjs.name, out_gltf.name)
@@ -1033,25 +1058,10 @@ def convert_to_model(
             errors.append(f"osgconv-temp: {e}")
             _progress(f"step:convert_fail|{e}")
 
-    # --- 3) Pure-Python glTF (viewer-accurate verts/indices; no weld hacks) ---
-    try:
-        from osgjs_convert import convert_osgjs
-
-        _progress("step:convert")
-        result = convert_osgjs(
-            work_dir,
-            model_name,
-            prefer="gltf",
-            texture_map=texture_map,
-            weld=False,
-            double_sided=False,
-        )
-        if result.is_file() and result.stat().st_size > 0:
-            _progress(f"step:export|{result.name}|{result.stat().st_size}")
+    if texture_map is None:
+        result = convert_with_texture_map()
+        if result is not None:
             return result
-    except Exception as e:
-        errors.append(f"python-gltf: {e}")
-        _progress(f"step:convert_fail|{e}")
 
     # --- 4) Raw decrypted files as last resort ---
     raw_note = work_dir / f"{model_name}.RAW_OSGJS.txt"
@@ -1178,6 +1188,15 @@ def download_one(
             out_dir, model_name, texture_map=tex_map, prefer="gltf"
         )
 
+        if model_path.suffix.lower() == ".gltf":
+            from osgjs_convert import pack_gltf_as_glb
+
+            try:
+                model_path = pack_gltf_as_glb(model_path)
+                _progress(f"step:export|{model_path.name}|{model_path.stat().st_size}")
+            except (ImportError, OSError, ValueError) as e:
+                log(f"  GLB packaging failed: {e}")
+
         # Keep user-facing assets: glTF (or raw osgjs/bin) + textures
         final_keep = {
             model_path.name,
@@ -1203,11 +1222,6 @@ def download_one(
 
         cleanup_work_dir(out_dir, final_keep)
 
-        # Prefer largest glTF/GLB as main deliverable if present
-        gltfs = list(out_dir.glob("*.gltf")) + list(out_dir.glob("*.glb"))
-        if gltfs:
-            model_path = max(gltfs, key=lambda p: p.stat().st_size)
-
         meta = {
             "uid": uid,
             "name": display_name,
@@ -1218,7 +1232,7 @@ def download_one(
             "output": str(model_path),
             "format": model_path.suffix.lower().lstrip("."),
             "textures": len(list((out_dir / "textures").glob("*"))) if (out_dir / "textures").is_dir() else 0,
-            "note": "Prefer glTF via osgconv; fallback pure-python glTF; textures in textures/",
+            "note": "GLB embeds geometry and textures. The glTF export uses its sidecar files.",
         }
         (out_dir / "info.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2),
@@ -1349,7 +1363,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         log("  Sketchfab Model Downloader (CLI)")
         log("  • no account / no API keys")
         log("  • public models, even without Download button")
-        log("  • output: glTF (+ textures when available)")
+        log("  • output: GLB (+ textures when available)")
         log("=" * 58)
 
     tools_ok = check_tools(quiet=args.quiet)
